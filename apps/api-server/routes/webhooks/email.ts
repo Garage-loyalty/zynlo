@@ -2,6 +2,8 @@ import { Router, Request, Response } from 'express'
 import { createClient } from '@supabase/supabase-js'
 import { z } from 'zod'
 import crypto from 'crypto'
+import { threadReconstructor } from '../../src/services/email/thread-reconstructor'
+import { attachmentHandler } from '../../src/services/email/attachment-handler'
 
 const router = Router()
 
@@ -44,27 +46,6 @@ const EmailWebhookSchema = z.object({
 })
 
 type EmailWebhookPayload = z.infer<typeof EmailWebhookSchema>
-
-// Helper function to extract ticket ID from subject or references
-function extractTicketId(subject: string, references?: string[]): string | null {
-  // Check subject for ticket ID pattern [#12345]
-  const subjectMatch = subject.match(/\[#(\d+)\]/)
-  if (subjectMatch) {
-    return subjectMatch[1]
-  }
-
-  // Check references for ticket ID
-  if (references && references.length > 0) {
-    for (const ref of references) {
-      const refMatch = ref.match(/ticket-(\d+)/)
-      if (refMatch) {
-        return refMatch[1]
-      }
-    }
-  }
-
-  return null
-}
 
 // Helper function to find or create customer
 async function findOrCreateCustomer(email: string, name?: string) {
@@ -154,25 +135,33 @@ router.post('/email', async (req: Request, res: Response) => {
     // Find email channel
     const channelId = await findEmailChannel()
 
-    // Extract ticket ID if this is a reply
-    const ticketId = extractTicketId(payload.subject, payload.references)
+    // Use thread reconstruction to find existing thread
+    const existingThread = await threadReconstructor.findExistingThread(
+      payload.messageId,
+      payload.inReplyTo,
+      payload.references,
+      payload.subject,
+      payload.from.email
+    )
 
     let conversationId: string
     let ticketRecord: any
 
-    if (ticketId) {
-      // This is a reply to an existing ticket
+    if (existingThread) {
+      // This is part of an existing thread
+      conversationId = existingThread.conversationId
+      
+      // Get ticket details
       const { data: ticket, error } = await supabase
         .from('tickets')
-        .select('id, conversation_id, status')
-        .eq('id', ticketId)
+        .select('*')
+        .eq('id', existingThread.ticketId)
         .single()
 
       if (error || !ticket) {
-        throw new Error(`Ticket #${ticketId} not found`)
+        throw new Error(`Ticket not found`)
       }
 
-      conversationId = ticket.conversation_id
       ticketRecord = ticket
 
       // Update ticket status if it was closed
@@ -186,7 +175,7 @@ router.post('/email', async (req: Request, res: Response) => {
           .eq('id', ticket.id)
       }
     } else {
-      // This is a new email, create a new ticket
+      // This is a new email thread, create a new ticket
       
       // Create conversation first
       const { data: conversation, error: convError } = await supabase
@@ -249,10 +238,11 @@ router.post('/email', async (req: Request, res: Response) => {
           headers: payload.headers,
           inReplyTo: payload.inReplyTo,
           references: payload.references,
-          attachments: payload.attachments,
           originalText: payload.text,
           originalHtml: payload.html,
-        }
+        },
+        // Don't include attachments here yet, they'll be processed separately
+        attachments: []
       })
       .select()
       .single()
@@ -261,19 +251,40 @@ router.post('/email', async (req: Request, res: Response) => {
       throw new Error(`Failed to create message: ${messageError.message}`)
     }
 
-    // Handle attachments if any
+    // Process attachments with the attachment handler
     if (payload.attachments && payload.attachments.length > 0) {
-      const attachmentRecords = payload.attachments.map(att => ({
-        message_id: message.id,
-        filename: att.filename,
-        content_type: att.contentType,
-        size: att.size,
-        url: att.url,
-      }))
+      // Convert webhook attachments to EmailMessage format
+      const emailMessage = {
+        uid: 0, // Not used for webhook processing
+        messageId: payload.messageId,
+        date: new Date(payload.receivedAt || new Date().toISOString()),
+        from: [{ address: payload.from.email, name: payload.from.name }],
+        to: payload.to.map(t => ({ address: t.email, name: t.name })),
+        cc: payload.cc?.map(c => ({ address: c.email, name: c.name })),
+        subject: payload.subject,
+        text: payload.text,
+        html: payload.html,
+        attachments: payload.attachments.map(att => ({
+          filename: att.filename,
+          contentType: att.contentType,
+          size: att.size,
+          content: att.content ? Buffer.from(att.content, 'base64') : undefined
+        })),
+        headers: new Map(Object.entries(payload.headers || {}))
+      }
 
-      await supabase
-        .from('attachments')
-        .insert(attachmentRecords)
+      try {
+        const uploadedAttachments = await attachmentHandler.processEmailAttachments(
+          emailMessage as any,
+          ticketRecord.id,
+          message.id
+        )
+
+        console.log(`Uploaded ${uploadedAttachments.length} attachments for message ${message.id}`)
+      } catch (error) {
+        console.error('Failed to process attachments:', error)
+        // Don't fail the webhook, just log the error
+      }
     }
 
     // Send success response

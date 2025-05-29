@@ -58,7 +58,7 @@ Thumbs.db
 # Cursor
 .cursor/*
 !.cursor/rules
-!.cursor/mcp.json
+.cursor/mcp.json
 
 # Supabase
 **/supabase/.branches

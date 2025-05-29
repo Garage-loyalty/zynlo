@@ -25,7 +25,10 @@ import {
   X,
   Plus,
   CheckSquare,
-  Check
+  Check,
+  Reply,
+  ReplyAll,
+  Forward
 } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import { MessageContent } from './message-content'
@@ -43,12 +46,25 @@ import {
   useRemoveLabel,
   useSendEmailReply,
   useCreateTask,
-  type Database
+  type Database,
+  useTicketMessages,
+  useAgents,
+  Message as MessageType,
+  Ticket as TicketType,
+  Customer as CustomerType,
+  SendMessageParams,
+  UpdateTicketParams
 } from '@zynlo/supabase'
 import { useQuery } from '@tanstack/react-query'
 import { supabase } from '@zynlo/supabase'
 import { useSelectedTicketSafe } from '@/hooks/use-selected-ticket'
 import { useRouter } from 'next/navigation'
+import { Button } from '@zynlo/ui'
+import { formatDistanceToNow } from 'date-fns'
+import { nl } from 'date-fns/locale'
+import { showToast } from './toast'
+import { EmailComposer, EmailData } from './email-composer'
+import { createClient } from '@supabase/supabase-js'
 
 type TicketStatus = Database['public']['Enums']['ticket_status']
 type TicketPriority = Database['public']['Enums']['ticket_priority']
@@ -71,6 +87,23 @@ const priorityOptions = [
   { value: 'high' as TicketPriority, label: 'Hoog', color: 'text-orange-500' },
   { value: 'urgent' as TicketPriority, label: 'Urgent', color: 'text-red-500' },
 ]
+
+// Initialize Supabase client
+const supabaseClient = createClient(
+  process.env.NEXT_PUBLIC_SUPABASE_URL!,
+  process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!
+)
+
+const CHANNEL_ICONS = {
+  email: <Mail className="h-4 w-4" />,
+  whatsapp: <Phone className="h-4 w-4" />,
+  chat: <MessageSquare className="h-4 w-4" />,
+  phone: <Phone className="h-4 w-4" />,
+  twitter: <AtSignIcon className="h-4 w-4" />,
+  facebook: <MessageSquare className="h-4 w-4" />,
+  instagram: <MessageSquare className="h-4 w-4" />,
+  voice: <MicIcon className="h-4 w-4" />,
+}
 
 interface TicketDetailProps {
   ticketNumber: number
@@ -135,6 +168,10 @@ export function TicketDetail({ ticketNumber }: TicketDetailProps) {
   const [newTaskTitle, setNewTaskTitle] = useState('')
   const [showMoreMenu, setShowMoreMenu] = useState(false)
   const messagesEndRef = useRef<HTMLDivElement>(null)
+  const [expandedMessages, setExpandedMessages] = useState<Set<string>>(new Set())
+  const [showComposer, setShowComposer] = useState(false)
+  const [composerMode, setComposerMode] = useState<'reply' | 'reply-all' | 'forward'>('reply')
+  const [selectedMessage, setSelectedMessage] = useState<MessageType | null>(null)
 
   const scrollToBottom = () => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' })
@@ -337,6 +374,86 @@ export function TicketDetail({ ticketNumber }: TicketDetailProps) {
     new Date(a.created_at).getTime() - new Date(b.created_at).getTime()
   )
 
+  // Handle status update
+  const handleStatusUpdate = async (newStatus: string) => {
+    if (!ticket) return
+
+    try {
+      await updateTicket.mutateAsync({
+        ticketId: ticket.id,
+        status: newStatus
+      })
+      showToast('success', 'Ticket status updated')
+    } catch (error) {
+      console.error('Failed to update status:', error)
+      showToast('error', 'Failed to update ticket status')
+    }
+  }
+
+  // Open email composer
+  const openComposer = (mode: 'reply' | 'reply-all' | 'forward', message?: MessageType) => {
+    setComposerMode(mode)
+    setSelectedMessage(message || null)
+    setShowComposer(true)
+  }
+
+  // Handle email send
+  const handleEmailSend = async (emailData: EmailData) => {
+    if (!user || !ticket.conversation?.id) return
+
+    try {
+      // Send email via API
+      const response = await fetch('/api/send-email-reply', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          ticketNumber: ticket.number,
+          content: emailData.text, // Use plain text for now
+          agentName: user.user_metadata?.full_name || user.email?.split('@')[0] || 'Agent',
+          agentEmail: user.email || 'noreply@helpdesk.com',
+          to: emailData.to,
+          cc: emailData.cc,
+          bcc: emailData.bcc,
+          subject: emailData.subject,
+          html: emailData.html,
+          inReplyTo: emailData.inReplyTo,
+          references: emailData.references,
+          attachments: emailData.attachments
+        })
+      })
+
+      const result = await response.json()
+
+      if (!result.success) {
+        throw new Error(result.error || 'Failed to send email')
+      }
+
+      // Save the message to database
+      await sendMessage.mutateAsync({
+        conversationId: ticket.conversation.id,
+        content: emailData.html,
+        isInternal: false,
+        senderId: user.id,
+        senderType: 'agent',
+        ticketId: ticket.id
+      })
+
+      showToast('success', 'Email sent successfully')
+      setShowComposer(false)
+      setSelectedMessage(null)
+    } catch (error) {
+      console.error('Failed to send email:', error)
+      showToast('error', 'Failed to send email')
+    }
+  }
+
+  // Handle quick reply
+  const handleQuickReply = () => {
+    openComposer('reply', sortedMessages[sortedMessages.length - 1])
+  }
+
   return (
     <div className="h-full flex">
       {/* Main Chat Area */}
@@ -522,6 +639,9 @@ export function TicketDetail({ ticketNumber }: TicketDetailProps) {
                 senderInitial = 'S'
               }
 
+              const isExpanded = expandedMessages.has(message.id)
+              const isInternal = message.metadata?.isInternal || false
+
               return (
                 <div key={message.id}>
                   {showDate && (
@@ -557,7 +677,7 @@ export function TicketDetail({ ticketNumber }: TicketDetailProps) {
                         <span className="text-xs text-gray-500">
                           {formatTime(message.created_at)}
                         </span>
-                        {message.is_internal && (
+                        {isInternal && (
                           <span className="text-xs bg-yellow-100 text-yellow-800 px-2 py-0.5 rounded">
                             Interne notitie
                           </span>
@@ -593,52 +713,59 @@ export function TicketDetail({ ticketNumber }: TicketDetailProps) {
           </div>
         </div>
 
-        {/* Message Input */}
-        <div className="border-t border-gray-200 px-6 py-4">
-          <div className="flex items-center gap-2 mb-3">
-            <button
-              onClick={() => setIsInternalNote(!isInternalNote)}
-              className={cn(
-                "px-3 py-1 text-sm rounded-md transition-colors",
-                isInternalNote
-                  ? "bg-yellow-100 text-yellow-800 border border-yellow-300"
-                  : "bg-gray-100 text-gray-700 hover:bg-gray-200"
-              )}
-            >
-              {isInternalNote ? "Interne notitie" : "Antwoord naar klant"}
-            </button>
-          </div>
-          <div className="flex gap-2">
-            <button className="p-2 hover:bg-gray-100 rounded">
-              <Paperclip className="w-5 h-5 text-gray-600" />
-            </button>
-            <textarea
-              value={newMessage}
-              onChange={(e) => setNewMessage(e.target.value)}
-              onKeyDown={(e) => {
-                if (e.key === 'Enter' && !e.shiftKey) {
-                  e.preventDefault()
-                  handleSendMessage()
-                }
+        {/* Composer or Quick Reply */}
+        {showComposer ? (
+          <div className="border-t bg-white">
+            <EmailComposer
+              mode={composerMode}
+              inReplyTo={selectedMessage ? {
+                messageId: selectedMessage.metadata?.messageId || selectedMessage.id,
+                subject: ticket.subject,
+                from: {
+                  email: ticket.customer?.email || 'unknown@example.com',
+                  name: ticket.customer?.name
+                },
+                date: new Date(selectedMessage.created_at),
+                content: selectedMessage.content,
+                references: selectedMessage.metadata?.references
+              } : undefined}
+              defaultTo={composerMode !== 'compose' && ticket.customer?.email ? [{
+                email: ticket.customer.email,
+                name: ticket.customer.name
+              }] : []}
+              defaultSubject={ticket.subject}
+              onSend={handleEmailSend}
+              onCancel={() => {
+                setShowComposer(false)
+                setSelectedMessage(null)
               }}
-              placeholder={isInternalNote ? "Schrijf een interne notitie..." : "Schrijf een antwoord..."}
-              className="flex-1 resize-none rounded-lg border border-gray-300 px-4 py-2 focus:outline-none focus:ring-2 focus:ring-blue-500"
-              rows={3}
+              fromAddress={{
+                email: user?.email || 'support@zynlo.com',
+                name: user?.user_metadata?.full_name || 'Support Agent'
+              }}
+              channelId={ticket.channel?.id}
             />
-            <button
-              onClick={handleSendMessage}
-              disabled={!newMessage.trim() || sendMessage.isPending}
-              className="px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 flex items-center gap-2 disabled:opacity-50 disabled:cursor-not-allowed"
-            >
-              {sendMessage.isPending ? (
-                <Loader2 className="w-4 h-4 animate-spin" />
-              ) : (
-                <Send className="w-4 h-4" />
-              )}
-              <span>Verstuur</span>
-            </button>
           </div>
-        </div>
+        ) : (
+          <div className="border-t bg-white p-4">
+            <div className="flex items-center gap-2">
+              <Button
+                onClick={handleQuickReply}
+                className="flex-1"
+              >
+                <Send className="h-4 w-4 mr-2" />
+                Reply to Customer
+              </Button>
+              <Button
+                variant="outline"
+                onClick={() => setIsInternalNote(true)}
+              >
+                <LockIcon className="h-4 w-4 mr-2" />
+                Add Internal Note
+              </Button>
+            </div>
+          </div>
+        )}
       </div>
 
       {/* Sidebar */}
